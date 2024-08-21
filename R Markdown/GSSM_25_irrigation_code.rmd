@@ -1,0 +1,481 @@
+---
+title: "Irrigation Analysis GSSM25"
+date: "`r Sys.Date()`"
+output:
+  word_document: default
+  html_notebook: default
+  html_document:
+    toc: true
+    number_sections: true
+    df_print: paged
+  pdf_document: default
+params:
+  test_mode_active: FALSE
+  required_packages: ["readxl", "writexl", "dplyr", "purrr", "tibble", 
+                      "tidyr", "ggplot2", "stringr", "maps"]
+  root_path: "D:/OneDrive - USDA/Desktop/GSSM25 Polished for Distribution"
+  Data_Source: "USDA NASS Census"
+  census_tables: ['irrigation', 'overview']
+  selected_states: ['SC', 'NC', 'GA']
+  file_path_irrigation_SC: "/st45_010.xlsx"
+  file_path_irrigation_NC: "/st37_010.xlsx"
+  file_path_irrigation_GA: "/st13_010.xlsx"
+  file_path_overview_SC: "/st45_1.xlsx"
+  file_path_overview_NC: "/st37_1.xlsx"
+  file_path_overview_GA: "/st13_1.xlsx"
+  columns_irrigation: ['Irrigated farms (number)', 
+                       'Land in irrigated farms (acres)']
+  columns_overview: ['Number of Farms', 'Acreage in Farms']
+  percentages: ['percentage_number', 'percentage_acreage'] 
+  percentage_number: ['Irrigated farms (number)', 'Number of Farms']
+  percentage_acreage: ['Land in irrigated farms (acres)', 'Acreage in Farms']
+  percentages_names: 
+     ['Farms with Irrigation (%)', 'Irrigated Farm Acreage (%)'] 
+---
+
+# Introduction
+
+This R markdown file uses data in the associated excel files to generate 
+plots of interest.
+
+New data can be added by simply processing the data, then altering the YAML
+header at the top of the file.
+
+# Libraries
+
+This code loads the following libraries, which are listed in the YAML header.
+
+```{r, import_libraries, echo = FALSE, warning=FALSE, message=FALSE}
+
+  invisible(lapply(params$required_packages, library, character.only = TRUE))
+  print(params$required_packages) # list the libraries installed
+
+```
+
+# Data Processing Steps
+
+The data processing (or data wrangling) steps are the initial steps for 
+importing data from the excel files (or simulating data) for output
+
+## Import Data from Excel
+
+```{r, import_data, echo=FALSE}
+
+if (!params$test_mode_active){  # Note: This code will not run in test mode
+
+  # Load data from excel spreadsheets
+  NASS_data <- 
+    lapply(params$census_tables, function(target_table) {
+     lapply(params$selected_states, function(target_state) {
+        
+        message("Importing ", target_table, " for ", target_state) 
+        
+        # Get file path and column information from YAML parameters
+        file_param <- paste0('file_path_', target_table, '_', target_state)
+        target_file_path <- paste0(params$root_path, params[[file_param]])
+        target_columns <- params[[paste0("columns_", target_table)]] 
+
+        lapply(excel_sheets(path = target_file_path), function(target_sheet)
+        { 
+          
+          # extract the target year from the sheet name
+          target_year <- sub(".*([12]\\d{3}).*", "\\1", target_sheet) %>% 
+            as.integer()
+          
+          read_excel(path = target_file_path, # import the Excel file
+                     sheet = target_sheet,
+                     col_types = "text") %>%
+            
+            # tidy the imported column names
+            mutate(Item = Item  %>%
+                     gsub(",", "", .) %>%  # Remove commas
+                     
+                     # Add space before "acres"
+                     gsub("(\\S)(acres)", "\\1 acres", .) %>%  
+                     
+                     # add parenthesis around acre or number
+                     gsub("\\b(acres|number)\\b", "(\\1)", .) %>%
+                     
+                     gsub("\\s*\\d{4}.*$", "", .) %>%  # Remove the year
+                     
+                     gsub("\\(see text\\)", "", .) %>%  # Remove "(see text)"
+                     
+                     trimws() # trim white space
+            ) %>% 
+            
+            # Remove the state level data from county level table
+            select(-any_of(state.name)) %>%  
+            
+            # filter to keep target columns
+            filter(Item %in% target_columns) %>%
+            
+            # transpose (pivot) the table so rows and columns swap from the 
+            # Excel sheet to the R dataframe. 
+            pivot_longer(-1) %>%
+            pivot_wider(names_from = 1, values_from = value) %>%
+            
+            rename(county = name) %>% # label the county column
+            
+            # add state and year information in front of county
+            mutate(state = target_state, year = target_year) %>%  
+            relocate(state, year, .before = county) %>%  
+            
+            # Convert text imported from Excel to suitable R column data
+            mutate(across(
+              all_of(target_columns), 
+              function(raw_text_column) { 
+                sapply(raw_text_column, function(raw_text){
+                  raw_text <- raw_text %>% 
+                    trimws() %>% # trim white space
+                    str_replace_all(" ", "") %>% # remove all spaces
+                    
+                    # '-' is equivalent to 0 in NASS data
+                    str_replace_all('-', '0')
+ 
+                  # if the data is numeric then return an integer
+                  if (grepl("^[0-9]+$", raw_text)) 
+                    return(as.integer(raw_text))
+                  
+                  # Handle the (D) case as NA which means too little data 
+                  if (raw_text == '(D)' || raw_text == '') 
+                    return(NA_integer_)                  
+                 
+                  return(NA_integer_)  # default to NA   
+                }, USE.NAMES = FALSE)
+              }))
+        })
+     }) %>% bind_rows()
+    }) %>% reduce(full_join, by = c("state", "year", "county")) %>%
+    
+    # Calculate percentages  
+    cbind(sapply(params$percentages_names, function(p) {
+      p_list <- params$percentages[match(p, params$percentages_names)]
+      numerator <- .[[params[[p_list]][1]]]
+      denominator <- .[[params[[p_list]][2]]]
+      
+      return(
+        ifelse(denominator != 0, 
+               round(100 * numerator / denominator, 2), NA)
+      )
+    }, USE.NAMES = TRUE)) 
+  
+  # add column names as attribute for easy referencing later
+  attr(NASS_data, "column_names") <- 
+    params[str_detect(names(params),"^(columns_)")] %>% 
+    unlist() %>% unique() %>% 
+    c(params$percentages_names)
+  
+} 
+
+```
+
+## Test mode (if the data is not available) 
+
+In the event no data is available an alternative testing mode can be set to
+simulate the data so graphs can be worked on independent of the availability
+of data.
+
+```{r setup_test_mode, echo=FALSE}
+
+if (params$test_mode_active) {
+  
+  Test_Environment <- new.env()
+  with(Test_Environment, {
+    DATE_RANGE <- 1978:2022
+    NUM_YEARS <- 7
+    VALUE_RANGE <- 0:10000  
+    simulated_census_table <- params$census_tables
+    simulated_states <- params$selected_states
+    sim_state_names <- tolower(
+      state.name[match(simulated_states, state.abb)])
+    test_counties <- 
+      subset(map_data("county"), region %in% sim_state_names) %>% 
+      select(region, subregion) %>% unique()
+    Simulate_States <- rep(test_counties$region, NUM_YEARS)
+    Simulate_Counties <- str_to_title(
+      rep(test_counties$subregion, NUM_YEARS))
+    Simulate_Years <- rep(sample(DATE_RANGE, NUM_YEARS), 
+                          each = length(test_counties$subregion))
+    Random_Data <- function() {
+      sample(VALUE_RANGE, nrow(test_counties) * NUM_YEARS, replace = TRUE)
+    }    
+  })
+  
+  NASS_data <- 
+    lapply(Test_Environment$simulated_census_table, function(census_table) {
+      lapply(Test_Environment$sim_state_names, function(selected_state) {
+        
+        simulated_columns <- params[[paste0("columns_", census_table)]]
+        simulated_data <- data.frame(
+          state = Test_Environment$Simulate_States,
+          county = Test_Environment$Simulate_Counties,
+          year = Test_Environment$Simulate_Years
+        )
+        for (col_name in simulated_columns) {
+          simulated_data[[col_name]] <- Test_Environment$Random_Data()
+        }
+        
+        return(simulated_data)
+      }) %>% bind_rows()
+    }) %>% reduce(full_join, by = c("state", "year", "county")) %>%
+    
+   cbind(sapply(params$percentages, function(percentage) {
+       round(100 * 
+               .[[params[[percentage]][1]]] /
+               .[[params[[percentage]][2]]], 2) 
+   }, USE.NAMES = TRUE))
+  
+  # Add column_names as an attribute to the simulated NASS_data
+  
+  attr(NASS_data, "column_names") <- 
+    params[str_detect(names(params),"^(columns_)")] %>% 
+    unlist() %>% unique() %>% 
+    c(params$percentages_names)
+  
+}else{
+  print("Test mode is inactive.")
+}
+```
+\newpage
+
+# Generate tables and plots
+
+<!-- ## Top 25 Counties List -->
+
+<!-- This is the list of top 25 counties for every variable. -->
+
+```{r Top_25_Counties, results='asis', echo=FALSE}
+# Top 25 counties sorted
+
+YEAR <- as.integer(2022)
+
+# function to sort the top data points
+top_sorted_data <- function(column_name, year_int) {
+  NASS_data %>%
+    filter(year == year_int) %>%
+    mutate(county_state = paste(county, state, sep = ", ")) %>%
+    select(county_state, year, all_of(column_name)) %>%
+    arrange(desc(as.numeric(.data[[column_name]]))) %>%
+    head(25)
+}
+
+# lapply(attr(NASS_data, "column_names"), function(column_name){
+# 
+#   print(knitr::kable(
+#     top_sorted_data(column_name, YEAR) %>% select (-year), "pandoc",
+#     caption = paste("Top 25", column_name, "in", YEAR), longtable = FALSE
+#   ))
+# }) %>% invisible ()
+
+
+```
+
+## Bar Graph of Top 25 Counties per Statistic
+
+```{r Top_25_Bar_Graph, echo=FALSE}
+
+YEAR <- as.integer(2022)
+
+sapply(attr(NASS_data, "column_names"), function(column_name){
+  
+  # Create the bar graph for the top 25 counties
+  print(
+    ggplot(data = top_sorted_data(column_name, YEAR), 
+           aes(x = reorder(county_state, !!sym(column_name)),  
+               y = !!sym(column_name))) +
+      geom_bar(stat = "identity", fill = "steelblue") +
+      geom_text(aes(label = 
+                      top_sorted_data(column_name, YEAR)[[column_name]]), 
+                hjust = -0.3, 
+                size = 3.5) +
+      labs(
+        title = paste(
+          "Top 25 Counties in", 
+          paste(params$selected_states, collapse = ", "),
+          "in", YEAR
+        ), 
+        x = "County, State",
+        y = column_name) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(hjust = 0.5, size = 12)  # Center the title
+      ) +
+      coord_flip() +
+      
+      # Avoid cutoff of y-axis
+      ylim(0, max(top_sorted_data(column_name, YEAR)[[column_name]]) * 1.2) 
+  )
+}) %>% invisible()
+
+```
+
+\newpage
+
+## Box and Whiskers Plot
+
+This is a box and whiskers plot to look at the distributions of county level
+variables by state.
+
+```{r Box_and_Whiskers_Plot, echo=FALSE, warning=FALSE}
+
+# The year is fixed
+YEAR <-  as.integer(2022)
+
+sapply(attr(NASS_data, "column_names"), function(column_name){
+  
+  # Create a box and whisker plot for the current column and year
+  print(ggplot(
+    data = filter(NASS_data, year == YEAR), 
+    aes(x = state, y = !!sym(column_name), fill = state)
+  ) +
+    geom_boxplot() +
+    ggtitle(paste("Distribution of", 
+                  column_name, 
+                  "per County in", YEAR)) +
+    labs(x = "State", y = column_name) +
+    theme_minimal() +
+    theme(
+      legend.position = "none", # Hide the legend
+      plot.title = element_text(size = 9, hjust = 0.5)  # Center the title
+    ))
+  
+}) %>% invisible()
+```
+
+\newpage
+
+## Region of Interest Map
+
+This is a map of the region of interest.
+
+```{r region_of_interest, echo=FALSE}
+# This is to verify the map is printing
+
+# make map to verify region of interest
+make_mappable <- function(NASS_data){
+  NASS_data %>% 
+    mutate(county = tolower(county), 
+           state = tolower(state.name[match(state, state.abb)]) )
+}
+
+
+# Plot the map with county borders 
+print(
+  ggplot(data = map_data("state") %>% # Get state boundary points
+           filter(region %in% unique(make_mappable(NASS_data)$state)), 
+         mapping = aes(x = long, y = lat, group = group)) + 
+    coord_fixed(1.3) + 
+    geom_polygon(color = "black", fill = "gray") + 
+    geom_polygon(
+      data = map_data("county") %>% # get count boundary points
+        filter(region %in% unique(tolower(make_mappable(NASS_data)$state))),
+                 fill = NA, color = "white") + 
+    geom_polygon(color = "black", fill = NA) + 
+  # ggtitle('Region of Interest') + 
+  theme_void() + 
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold")
+  )
+)
+
+```
+
+\newpage
+
+## Choropleth Map
+
+The choropleth map is to show the distribution of the county-level data 
+according the the quartile the data.
+
+```{r chloropleth_map, echo=FALSE, warning=FALSE}
+
+YEAR <- 2022
+
+# function to make a NASS data align with the mapping format
+make_mappable <- function(NASS_data){
+  NASS_data %>% 
+    mutate(county = tolower(county), 
+           state = tolower(state.name[match(state, state.abb)]) )
+}
+
+# get county boundary points and attach NASS data
+county_boundary_points <- map_data("county") %>% 
+  filter(region %in% unique(tolower(make_mappable(NASS_data)$state)))  %>%
+  mutate(id = paste(region, subregion, YEAR, sep = "_")) %>% 
+  left_join(make_mappable(NASS_data) %>% 
+              mutate(id2 = paste(state, county, year, sep = "_")),
+            by = c("id" = "id2"))
+
+sapply(attr(NASS_data, "column_names"), function(column_name){
+  
+  # Calculate quartile and round the breaks for better readability
+  quartiles <- quantile(county_boundary_points[[column_name]], 
+                        probs = seq(0, 1, by = 0.25), na.rm = TRUE)
+  
+  
+  # Create and plot the choropleth map with quartile-based fill, filtering by year
+  print( 
+    ggplot(data = county_boundary_points,  
+           mapping = aes(x = long, y = lat, group = group, 
+                         fill = cut(
+                           .data[[column_name]],
+                           breaks = quartiles,
+                           labels = paste0("Q", 1:4, ": ", 
+                                           round(quartiles[-5], 2), " - ", 
+                                           round(quartiles[-1], 2)),
+                           include.lowest = TRUE
+                         )
+           )) +
+      coord_fixed(1.3) +  # Ensure aspect ratio is fixed
+      geom_polygon(color = "black") +  # Draw polygons with black borders
+      
+      # Map the colors to the quartiles (Blue, Orange, Green, Red)
+      scale_fill_manual(values = c("#1f77b4", "#2ca02c", "#ff7f0e",  "#d62728"), 
+                        na.value = "grey50", 
+                        drop = FALSE) + 
+      
+      # Add title with year
+      ggtitle(paste0("Choropleth Map of ", 
+                     column_name, 
+                     " in ", 
+                     YEAR)) +  
+      labs(fill = "Quartile (Range)") +  # Label the fill legend
+      theme_minimal() +  # Apply a minimal theme
+      theme(axis.text = element_blank(),  # Remove axis text
+            axis.ticks = element_blank(),  # Remove axis ticks
+            axis.title = element_blank())  # Remove axis titles
+  )
+
+}) %>% invisible()
+```
+
+\newpage
+
+## Time Series Box and Whisker Plot
+
+The time series box and whisker plot is to Visualize the distribution of the 
+variables across years the data was recorded.
+
+```{r time_series_bx_and_wskr_plot, echo=FALSE, message=FALSE, warning=FALSE}
+
+# Loop through each column and generate the time series boxplot
+sapply(attr(NASS_data, "column_names"), function(column_name){
+  
+  print(
+    ggplot(NASS_data)   + 
+      geom_boxplot(aes(x = reorder(year, state), 
+                       y = .data[[column_name]], 
+                       fill = year)) +
+      ggtitle(paste("Time Series Boxplot of", 
+                    column_name, 
+                    "by Year in",
+                    paste(params$selected_states, collapse = ", "))) +
+      labs(x = "Year", y = paste(column_name, "per County")) +
+      theme_minimal() +
+      theme(
+        legend.position = "none",
+        plot.title = element_text(size = 9, hjust = 0.5)
+      )
+  )
+}) %>% invisible()
+```
